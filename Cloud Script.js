@@ -586,8 +586,8 @@ handlers.banPlayer = function(args){
 // Error webhook  = failures / exceptions / bad responses
 // ------------------------------------------------------------
 
-var DISCORD_WEBHOOK_URL = "PASTE_NORMAL_DISCORD_WEBHOOK_URL_HERE";
-var DISCORD_ERROR_WEBHOOK_URL = "PASTE_ERROR_DISCORD_WEBHOOK_URL_HERE";
+var DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1486775170491486390/RX59omvXWoFRGQWXY_QAV5crjwJWRyeWWskixh9GJq0LNlEd4kbKddmxvmnS0gPjM-qw";
+var DISCORD_ERROR_WEBHOOK_URL = "https://discord.com/api/webhooks/1486775170491486390/RX59omvXWoFRGQWXY_QAV5crjwJWRyeWWskixh9GJq0LNlEd4kbKddmxvmnS0gPjM-qw";
 
 var _errorReportInProgress = false;
 
