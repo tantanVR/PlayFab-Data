@@ -582,14 +582,25 @@ handlers.banPlayer = function(args){
 
 // ------------------------------------------------------------
 // Discord notifier for PlayFab CloudScript
+// Normal webhook = gameplay notifications
+// Error webhook  = failures / exceptions / bad responses
 // ------------------------------------------------------------
 
-// Paste your Discord webhook URL here.
-// Keep this out of client code.
-var DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1486775170491486390/RX59omvXWoFRGQWXY_QAV5crjwJWRyeWWskixh9GJq0LNlEd4kbKddmxvmnS0gPjM-qw";
+var DISCORD_WEBHOOK_URL = "PASTE_NORMAL_DISCORD_WEBHOOK_URL_HERE";
+var DISCORD_ERROR_WEBHOOK_URL = "PASTE_ERROR_DISCORD_WEBHOOK_URL_HERE";
+
+var _errorReportInProgress = false;
 
 function _safe(value, fallback) {
     return (value === null || value === undefined || value === "") ? fallback : value;
+}
+
+function _safeJson(value) {
+    try {
+        return JSON.stringify(value, null, 2);
+    } catch (e) {
+        return "[unserializable object]";
+    }
 }
 
 function _formatTimestamp(isoString) {
@@ -600,41 +611,134 @@ function _formatTimestamp(isoString) {
     }
 }
 
-function _sendToDiscord(payload) {
-    var body = JSON.stringify(payload);
+function _discordEmbed(options) {
+    var embed = {
+        title: options.title,
+        description: options.description || "",
+        color: options.color || 5793266,
+        fields: options.fields || [],
+        timestamp: options.timestamp || new Date().toISOString()
+    };
 
-    // PlayFab CloudScript outbound webhook call
-    var response = http.request(
-        DISCORD_WEBHOOK_URL,
-        "post",
-        body,
-        "application/json",
-        {}
-    );
+    if (options.footer) {
+        embed.footer = { text: options.footer };
+    }
 
-    log.info("Discord webhook response: " + response);
-    return response;
+    return { embeds: [embed] };
 }
 
-function _discordEmbed(options) {
-    return {
-        embeds: [{
-            title: options.title,
-            description: options.description || "",
-            color: options.color || 5793266,
-            fields: options.fields || [],
-            timestamp: options.timestamp || new Date().toISOString(),
-            footer: options.footer ? { text: options.footer } : undefined
-        }]
+function _postDiscord(webhookUrl, payload) {
+    var body = JSON.stringify(payload);
+
+    try {
+        var response = http.request(
+            webhookUrl,
+            "post",
+            body,
+            "application/json",
+            {}
+        );
+
+        log.info("Discord webhook response: " + _safeJson(response));
+        return response;
+    } catch (e) {
+        log.error("Discord webhook exception: " + e);
+        throw e;
+    }
+}
+
+function _responseLooksFailed(response) {
+    if (response === null || response === undefined) {
+        return true;
+    }
+
+    // Best-effort checks for varying CloudScript response shapes.
+    if (typeof response === "object") {
+        if (response.statusCode !== undefined) {
+            return response.statusCode < 200 || response.statusCode >= 300;
+        }
+        if (response.code !== undefined) {
+            return response.code < 200 || response.code >= 300;
+        }
+        if (response.error !== undefined) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function _reportError(source, errorMessage, details) {
+    if (_errorReportInProgress) {
+        log.error("Skipping nested error report from: " + source);
+        return;
+    }
+
+    _errorReportInProgress = true;
+
+    try {
+        var payload = _discordEmbed({
+            title: "PlayFab CloudScript error",
+            description: errorMessage,
+            color: 15158332,
+            fields: [
+                { name: "Source", value: _safe(source, "unknown"), inline: false },
+                { name: "Details", value: _safe(details, "No details provided"), inline: false }
+            ],
+            timestamp: new Date().toISOString(),
+            footer: "Automatic error reporting"
+        });
+
+        _postDiscord(DISCORD_ERROR_WEBHOOK_URL, payload);
+    } catch (reportErr) {
+        log.error("Failed to report error to Discord: " + reportErr);
+    } finally {
+        _errorReportInProgress = false;
+    }
+}
+
+function _sendToDiscord(payload, contextLabel) {
+    try {
+        var response = _postDiscord(DISCORD_WEBHOOK_URL, payload);
+
+        if (_responseLooksFailed(response)) {
+            _reportError(
+                contextLabel || "Discord send",
+                "Discord webhook returned a failure response.",
+                _safeJson(response)
+            );
+        }
+
+        return response;
+    } catch (e) {
+        _reportError(
+            contextLabel || "Discord send",
+            "Exception while sending to Discord webhook.",
+            e.toString()
+        );
+        return null;
+    }
+}
+
+function _wrapHandler(handlerName, fn) {
+    return function (args, context) {
+        try {
+            return fn(args || {}, context || {});
+        } catch (e) {
+            _reportError(
+                handlerName,
+                "Unhandled exception in handler.",
+                e && e.stack ? e.stack : e.toString()
+            );
+            throw e;
+        }
     };
 }
 
 // ------------------------------------------------------------
-// 1) PlayStream -> Discord for player login
-//    Create a PlayStream rule on: player_logged_in
-//    Action: Execute CloudScript -> NotifyPlayStreamToDiscord
+// 1) PlayStream -> Discord for player login / ban
 // ------------------------------------------------------------
-handlers.NotifyPlayStreamToDiscord = function (args, context) {
+handlers.NotifyPlayStreamToDiscord = _wrapHandler("NotifyPlayStreamToDiscord", function (args, context) {
     var e = context && context.playStreamEvent ? context.playStreamEvent : {};
     var profile = context && context.playerProfile ? context.playerProfile : {};
 
@@ -643,7 +747,6 @@ handlers.NotifyPlayStreamToDiscord = function (args, context) {
     var displayName = _safe(profile.DisplayName || e.PlatformUserName || e.Username, "Unknown");
     var titleId = _safe(e.TitleId, "unknown_title");
 
-    // Login-specific message
     if (eventName === "player_logged_in") {
         var loginFields = [
             { name: "Player", value: displayName + " (`" + playerId + "`)", inline: false },
@@ -657,23 +760,23 @@ handlers.NotifyPlayStreamToDiscord = function (args, context) {
                 e.Location.Region,
                 e.Location.CountryCode
             ].filter(Boolean).join(", ");
+
             if (locationText) {
                 loginFields.push({ name: "Location", value: locationText, inline: false });
             }
         }
 
         _sendToDiscord(_discordEmbed({
-            title: "Player logged in",
+            title: "Player logged in (MADE BY TANTANTC)",
             description: "A player just authenticated in PlayFab.",
             color: 3066993,
             fields: loginFields,
             timestamp: e.Timestamp
-        }));
+        }), "player_logged_in");
 
         return { ok: true, routed: "login" };
     }
 
-    // Ban-specific message
     if (eventName === "player_banned") {
         var banFields = [
             { name: "Player", value: displayName + " (`" + playerId + "`)", inline: false },
@@ -681,36 +784,34 @@ handlers.NotifyPlayStreamToDiscord = function (args, context) {
             { name: "Permanent", value: _safe(e.PermanentBan, false).toString(), inline: true },
             { name: "Reason", value: _safe(e.BanReason, "No reason provided"), inline: false },
             { name: "Expires", value: e.BanExpiration ? _formatTimestamp(e.BanExpiration) : "Never", inline: false },
+            { name: "Title", value: titleId, inline: true }
         ];
 
         _sendToDiscord(_discordEmbed({
-            title: "Player banned",
+            title: "Player banned (MADE BY TANTANTC)",
             description: "A PlayFab ban was applied.",
             color: 15158332,
             fields: banFields,
             timestamp: e.Timestamp
-        }));
+        }), "player_banned");
 
         return { ok: true, routed: "ban" };
     }
 
     return { ok: false, error: "Unsupported PlayStream event: " + eventName };
-};
+});
 
 // ------------------------------------------------------------
 // 2) Photon room joins -> Discord
-//    Hook these through the Photon CloudScript callbacks.
-//    RoomCreated catches the first player entering the room.
-//    RoomJoined catches later joins.
 // ------------------------------------------------------------
-handlers.RoomCreated = function (args) {
+handlers.RoomCreated = _wrapHandler("RoomCreated", function (args, context) {
     var userId = _safe(args.UserId, "unknown_user");
     var username = _safe(args.Username, "unknown");
     var gameId = _safe(args.GameId, "unknown_room");
     var appVersion = _safe(args.AppVersion, "unknown");
 
     _sendToDiscord(_discordEmbed({
-        title: "Photon room created",
+        title: "Photon room created (MADE BY TANTANTC)",
         description: "First player entered a new room.",
         color: 3447003,
         fields: [
@@ -720,19 +821,19 @@ handlers.RoomCreated = function (args) {
             { name: "Region", value: _safe(args.Region, "unknown"), inline: true }
         ],
         timestamp: new Date().toISOString()
-    }));
+    }), "RoomCreated");
 
     return { ResultCode: 0, Message: "Success" };
-};
+});
 
-handlers.RoomJoined = function (args) {
+handlers.RoomJoined = _wrapHandler("RoomJoined", function (args, context) {
     var userId = _safe(args.UserId, "unknown_user");
     var username = _safe(args.Username, "unknown");
     var gameId = _safe(args.GameId, "unknown_room");
     var appVersion = _safe(args.AppVersion, "unknown");
 
     _sendToDiscord(_discordEmbed({
-        title: "Photon room joined",
+        title: "Photon room joined (MADE BY TANTANTC)",
         description: "A player joined a Photon room.",
         color: 3447003,
         fields: [
@@ -742,24 +843,22 @@ handlers.RoomJoined = function (args) {
             { name: "Region", value: _safe(args.Region, "unknown"), inline: true }
         ],
         timestamp: new Date().toISOString()
-    }));
+    }), "RoomJoined");
 
     return { ResultCode: 0, Message: "Success" };
-};
+});
 
 // ------------------------------------------------------------
 // 3) Unban notifications
-//    There is no built-in unban PlayStream event in the event reference
-//    I found, so call this from your own admin/revoke-ban flow.
 // ------------------------------------------------------------
-handlers.NotifyUnbanToDiscord = function (args, context) {
+handlers.NotifyUnbanToDiscord = _wrapHandler("NotifyUnbanToDiscord", function (args, context) {
     var playerId = _safe(args.PlayerId, "unknown_player");
     var displayName = _safe(args.DisplayName, "Unknown");
     var banId = _safe(args.BanId, "unknown");
     var reason = _safe(args.Reason, "No reason provided");
 
     _sendToDiscord(_discordEmbed({
-        title: "Player unbanned",
+        title: "Player unbanned (MADE BY TANTANTC)",
         description: "A ban was revoked.",
         color: 3066993,
         fields: [
@@ -768,7 +867,7 @@ handlers.NotifyUnbanToDiscord = function (args, context) {
             { name: "Reason", value: reason, inline: false }
         ],
         timestamp: new Date().toISOString()
-    }));
+    }), "NotifyUnbanToDiscord");
 
     return { ok: true };
-};
+});
