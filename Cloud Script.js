@@ -871,3 +871,338 @@ handlers.NotifyUnbanToDiscord = _wrapHandler("NotifyUnbanToDiscord", function (a
 
     return { ok: true };
 });
+
+/*
+    PlayFab CloudScript: automatic display-name moderation
+
+    What this does:
+    - Checks a player's display name automatically
+    - Bans for 10 hours if the name matches either list
+    - Supports:
+        1) profaneWords
+        2) sexualWords
+    - Detects obfuscation like:
+        - random letters/numbers before or after the blocked word
+        - punctuation/spaces between characters
+        - common leetspeak substitutions like 3 -> e, 1 -> i, 0 -> o, 5 -> s, 7 -> t
+
+    Recommended triggers:
+    - player_displayname_changed
+    - player_logged_in
+    - optional scheduled batch scan for all players in a segment
+*/
+
+/* ---------------------------- CONFIGURATION ---------------------------- */
+
+var CONFIG = {
+    banHours: 10,
+
+    // If a name matches both lists, sexual takes priority.
+    sexualPriority: true,
+
+    // Edit these lists anytime.
+    profaneWords: [
+        "FUCK",
+        "SHIT",
+        "PISS",
+        "BITCH",
+        "ASSHOLE",
+        "CUNT",
+        "BASTARD",
+        "PUSSY",
+        "NIGGER",
+        "NIGGA",
+        "ASS",
+        "DICK",
+        "HITLER",
+        "ADOLF",
+        'NGA',
+        "NGER",
+        "NGGER",
+        "NGGA"
+    ],
+
+    sexualWords: [
+        "SEX",
+        "PORN",
+        "NUDE",
+        "NAKED",
+        "HORNY",
+        "BLOWJOB",
+        "PENIS",
+        "VAGINA"
+    ],
+
+    reasons: {
+        sexual: "Account action taken for an inappropriate sexual username that violates community standards. (AUTOMATED BAN)",
+        profane: "Account action taken for an inappropriate profane username that violates community standards. (AUTOMATED BAN)"
+    }
+};
+
+/* ----------------------------- UTILITIES ------------------------------ */
+
+function getTargetPlayFabId(args) {
+    if (args) {
+        if (args.playFabId) return String(args.playFabId).trim();
+        if (args.PlayFabId) return String(args.PlayFabId).trim();
+        if (args.playerId) return String(args.playerId).trim();
+        if (args.PlayerId) return String(args.PlayerId).trim();
+    }
+
+    if (typeof currentPlayerId !== "undefined" && currentPlayerId) {
+        return currentPlayerId;
+    }
+
+    throw new Error("No PlayFabId provided.");
+}
+
+function getDisplayNameForPlayer(playFabId) {
+    var result = server.GetUserAccountInfo({
+        PlayFabId: playFabId
+    });
+
+    if (!result || !result.UserInfo || !result.UserInfo.TitleInfo) {
+        return null;
+    }
+
+    return result.UserInfo.TitleInfo.DisplayName || null;
+}
+
+function banPlayer(playFabId, reason) {
+    return server.BanUsers({
+        Bans: [
+            {
+                PlayFabId: playFabId,
+                DurationInHours: CONFIG.banHours,
+                Reason: reason
+            }
+        ]
+    });
+}
+
+function isAlreadyBanned(playFabId) {
+    var info = server.GetUserAccountInfo({ PlayFabId: playFabId });
+    return !!(
+        info &&
+        info.UserInfo &&
+        info.UserInfo.TitleInfo &&
+        info.UserInfo.TitleInfo.isBanned
+    );
+}
+
+/*
+    Normalization:
+    - lowercase
+    - remove punctuation/spaces
+    - convert common obfuscation characters to their base letters
+*/
+function normalizeForMatch(value) {
+    if (value === null || value === undefined) return "";
+
+    var text = String(value).toLowerCase();
+
+    var map = {
+        "0": "O",
+        "1": "I",
+        "2": "Z",
+        "3": "E",
+        "4": "A",
+        "5": "S",
+        "6": "G",
+        "7": "T",
+        "8": "B",
+        "9": "G",
+        "@": "A",
+        "$": "S",
+        "!": "I"
+    };
+
+    var out = "";
+    for (var i = 0; i < text.length; i++) {
+        var ch = text.charAt(i);
+
+        if (map.hasOwnProperty(ch)) {
+            out += map[ch];
+            continue;
+        }
+
+        // Keep only letters and numbers.
+        if ((ch >= "A" && ch <= "Z") || (ch >= "0" && ch <= "9")) {
+            out += ch;
+        }
+    }
+
+    return out;
+}
+
+function findFirstMatch(displayName, wordList) {
+    var normalizedName = normalizeForMatch(displayName);
+    if (!normalizedName) return null;
+
+    for (var i = 0; i < wordList.length; i++) {
+        var blocked = normalizeForMatch(wordList[i]);
+        if (!blocked) continue;
+
+        // This catches:
+        // - prefix/suffix stuffing: xxBADWORD123
+        // - punctuation: b.a.d.w.o.r.d
+        // - common symbol/number substitutions
+        if (normalizedName.indexOf(blocked) !== -1) {
+            return wordList[i];
+        }
+    }
+
+    return null;
+}
+
+function classifyDisplayName(displayName) {
+    var sexualMatch = findFirstMatch(displayName, CONFIG.sexualWords);
+    var profaneMatch = findFirstMatch(displayName, CONFIG.profaneWords);
+
+    var matchedCategory = null;
+    var matchedTerm = null;
+    var banReason = null;
+
+    if (CONFIG.sexualPriority) {
+        if (sexualMatch) {
+            matchedCategory = "sexual";
+            matchedTerm = sexualMatch;
+            banReason = CONFIG.reasons.sexual;
+        } else if (profaneMatch) {
+            matchedCategory = "profane";
+            matchedTerm = profaneMatch;
+            banReason = CONFIG.reasons.profane;
+        }
+    } else {
+        if (profaneMatch) {
+            matchedCategory = "profane";
+            matchedTerm = profaneMatch;
+            banReason = CONFIG.reasons.profane;
+        } else if (sexualMatch) {
+            matchedCategory = "sexual";
+            matchedTerm = sexualMatch;
+            banReason = CONFIG.reasons.sexual;
+        }
+    }
+
+    return {
+        matchedCategory: matchedCategory,
+        matchedTerm: matchedTerm,
+        banReason: banReason
+    };
+}
+
+function moderateOnePlayer(playFabId) {
+    if (isAlreadyBanned(playFabId)) {
+        return {
+            playFabId: playFabId,
+            alreadyBanned: true,
+            banned: false
+        };
+    }
+
+    var displayName = getDisplayNameForPlayer(playFabId);
+    if (!displayName) {
+        return {
+            playFabId: playFabId,
+            banned: false,
+            reason: "No display name found."
+        };
+    }
+
+    var verdict = classifyDisplayName(displayName);
+
+    if (!verdict.matchedCategory) {
+        return {
+            playFabId: playFabId,
+            displayName: displayName,
+            banned: false
+        };
+    }
+
+    var banResult = banPlayer(playFabId, verdict.banReason);
+
+    return {
+        playFabId: playFabId,
+        displayName: displayName,
+        banned: true,
+        matchedCategory: verdict.matchedCategory,
+        matchedTerm: verdict.matchedTerm,
+        banHours: CONFIG.banHours,
+        reason: verdict.banReason,
+        banResult: banResult
+    };
+}
+
+/* ------------------------------ HANDLERS ------------------------------- */
+
+/*
+    Use this as the main automatic moderation call.
+    It can be hooked to:
+    - player_displayname_changed
+    - player_logged_in
+*/
+handlers.CheckDisplayNameAndBan = function (args, context) {
+    var playFabId = getTargetPlayFabId(args);
+    return moderateOnePlayer(playFabId);
+};
+
+/*
+    Convenience wrapper for display-name-change events.
+*/
+handlers.OnDisplayNameChanged = function (args, context) {
+    var playFabId = getTargetPlayFabId(args);
+    return moderateOnePlayer(playFabId);
+};
+
+/*
+    Convenience wrapper for login events.
+*/
+handlers.OnPlayerLoggedIn = function (args, context) {
+    var playFabId = getTargetPlayFabId(args);
+    return moderateOnePlayer(playFabId);
+};
+
+/*
+    Batch scan handler for scheduled tasks.
+
+    Pass:
+    {
+      "players": ["PFID1", "PFID2", "PFID3"]
+    }
+
+    This is how you sweep many players at once from a scheduled task
+    or from an admin process that feeds in IDs.
+*/
+handlers.ScanDisplayNamesBatch = function (args, context) {
+    var players = (args && args.players) ? args.players : [];
+    var results = [];
+
+    for (var i = 0; i < players.length; i++) {
+        try {
+            results.push(moderateOnePlayer(String(players[i]).trim()));
+        } catch (e) {
+            results.push({
+                playFabId: players[i],
+                banned: false,
+                error: String(e)
+            });
+        }
+    }
+
+    return {
+        scanned: results.length,
+        results: results
+    };
+};
+
+/*
+    Optional helper to inspect what the current lists are.
+*/
+handlers.GetModerationLists = function () {
+    return {
+        banHours: CONFIG.banHours,
+        profaneWords: CONFIG.profaneWords,
+        sexualWords: CONFIG.sexualWords
+    };
+};
